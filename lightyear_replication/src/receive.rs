@@ -211,6 +211,92 @@ impl ReplicationReceivePlugin {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec::Vec;
+    use bytes::Bytes;
+
+    fn updates_message(
+        group_id: ReplicationGroupId,
+        last_action_tick: Option<Tick>,
+    ) -> UpdatesMessage {
+        UpdatesMessage {
+            group_id,
+            last_action_tick,
+            entity_count: 0,
+            data: Bytes::new(),
+        }
+    }
+
+    #[test]
+    fn recv_updates_buffers_same_tick_as_latest() {
+        let group_id = ReplicationGroupId(0);
+        let mut receiver = ReplicationReceiver::new();
+        receiver.group_channels.insert(
+            group_id,
+            GroupChannel {
+                latest_tick: Some(Tick(10)),
+                ..Default::default()
+            },
+        );
+
+        receiver.recv_updates(updates_message(group_id, Some(Tick(10))), Tick(10));
+
+        let channel = receiver.group_channels.get(&group_id).unwrap();
+        assert_eq!(channel.buffered_updates.len(), 1);
+        assert!(receiver.received_this_frame);
+    }
+
+    #[test]
+    fn recv_updates_discards_ticks_older_than_latest() {
+        let group_id = ReplicationGroupId(0);
+        let mut receiver = ReplicationReceiver::new();
+        receiver.group_channels.insert(
+            group_id,
+            GroupChannel {
+                latest_tick: Some(Tick(10)),
+                ..Default::default()
+            },
+        );
+
+        receiver.recv_updates(updates_message(group_id, Some(Tick(9))), Tick(9));
+
+        let channel = receiver.group_channels.get(&group_id).unwrap();
+        assert_eq!(channel.buffered_updates.len(), 0);
+        assert!(!receiver.received_this_frame);
+    }
+
+    #[test]
+    fn read_updates_treats_same_tick_splits_as_current() {
+        let group_id = ReplicationGroupId(0);
+        let mut channel = GroupChannel {
+            latest_tick: Some(Tick(10)),
+            ..Default::default()
+        };
+        channel
+            .buffered_updates
+            .insert(updates_message(group_id, Some(Tick(10))), Tick(20));
+        channel
+            .buffered_updates
+            .insert(updates_message(group_id, Some(Tick(10))), Tick(20));
+        channel
+            .buffered_updates
+            .insert(updates_message(group_id, Some(Tick(10))), Tick(18));
+
+        let updates: Vec<_> = channel
+            .read_updates()
+            .map(|update| (update.remote_tick, update.is_history))
+            .collect();
+
+        assert_eq!(
+            updates,
+            Vec::from([(Tick(18), true), (Tick(20), false), (Tick(20), false)])
+        );
+        assert_eq!(channel.latest_tick, Some(Tick(20)));
+    }
+}
+
 impl Plugin for ReplicationReceivePlugin {
     fn build(&self, app: &mut App) {
         // PLUGINS
@@ -313,7 +399,7 @@ impl ReplicationReceiver {
 
         // NOTE: this is valid even after tick wrapping because we keep clamping the latest_tick values for each channel
         // if we have already applied a more recent update for this group, no need to keep this one (or should we keep it for history?)
-        if channel.latest_tick.is_some_and(|t| remote_tick <= t) {
+        if channel.latest_tick.is_some_and(|t| remote_tick < t) {
             trace!(
                 "discard because the update's tick {remote_tick:?} is older than the latest tick {:?}",
                 channel.latest_tick
@@ -469,6 +555,13 @@ impl ReplicationReceiver {
                     return;
                 };
 
+                let Some(max_applicable_tick) =
+                    channel.buffered_updates.tick_at(max_applicable_idx)
+                else {
+                    return;
+                };
+                let mut latest_update_tick = None;
+
                 // pop the oldest until we reach the max applicable index
                 while channel.buffered_updates.len() > max_applicable_idx {
                     let (remote_tick, message) = channel.buffered_updates.pop_oldest().unwrap();
@@ -480,21 +573,19 @@ impl ReplicationReceiver {
                     // Note that the channel.latest tick could still be None in case of authority-transfer!
                     if channel
                         .latest_tick
-                        .is_some_and(|latest_tick| remote_tick <= latest_tick)
+                        .is_some_and(|latest_tick| remote_tick < latest_tick)
                     {
                         // TODO: those ticks could be history and could be interesting. They are older than the latest_tick though
                         continue;
                     }
 
-                    // These ticks are more recent than the latest_tick, but only the most recent one is interesting to us
-                    let is_history = channel.buffered_updates.len() != max_applicable_idx;
-                    // most recent tick.
+                    // These ticks are more recent than the latest_tick, but only the most recent
+                    // tick is interesting to us. Multiple messages can share that tick when the
+                    // sender split a logical update across MTU-sized UpdatesMessage chunks; those
+                    // chunks are siblings, not redundant history.
+                    let is_history = remote_tick != max_applicable_tick;
                     if !is_history {
-                        // TODO: maybe instead of relying on this we could update the Confirmed.tick via event
-                        //  after PredictionSet::Spawn?
-                        // it is important to update the `latest_tick` because it is used to populate
-                        // the Confirmed.tick when the Confirmed entity is just spawned
-                        channel.latest_tick = Some(remote_tick);
+                        latest_update_tick = Some(remote_tick);
                     }
                     channel.apply_updates_message(
                         world,
@@ -506,6 +597,13 @@ impl ReplicationReceiver {
                         message,
                         remote_entity_map,
                     );
+                }
+                if let Some(remote_tick) = latest_update_tick {
+                    // TODO: maybe instead of relying on this we could update the Confirmed.tick via event
+                    //  after PredictionSet::Spawn?
+                    // it is important to update the `latest_tick` because it is used to populate
+                    // the Confirmed.tick when the Confirmed entity is just spawned
+                    channel.latest_tick = Some(remote_tick);
                 }
             })
     }
@@ -625,6 +723,10 @@ impl UpdatesBuffer {
         self.0.len()
     }
 
+    fn tick_at(&self, index: usize) -> Option<Tick> {
+        self.0.get(index).map(|(tick, _)| *tick)
+    }
+
     /// Get the index of the most recent element in the buffer which has a last_action_tick <= latest_tick,
     /// i.e. the latest_tick that has already been applied to the entity is more recent than the
     /// 'last_action_tick' for that update
@@ -665,6 +767,7 @@ struct UpdatesIterator<'a> {
     channel: &'a mut GroupChannel,
     /// We iterate until we reach this idx in the buffer
     max_applicable_idx: Option<usize>,
+    max_applicable_tick: Option<Tick>,
 }
 
 impl Iterator for UpdatesIterator<'_> {
@@ -686,7 +789,7 @@ impl Iterator for UpdatesIterator<'_> {
 
         // pop the oldest until we reach the max applicable index
         let (remote_tick, message) = self.channel.buffered_updates.pop_oldest().unwrap();
-        let is_history = self.channel.buffered_updates.len() != max_applicable_idx;
+        let is_history = Some(remote_tick) != self.max_applicable_tick;
         if !is_history {
             // TODO: maybe instead of relying on this we could update the Confirmed.tick via event
             //  after PredictionSet::Spawn?
@@ -723,10 +826,13 @@ impl GroupChannel {
         //  older updates are redundant. The older ticks are included so that we can have a comprehensive
         //  confirmed history, for example to have a better interpolation)
         let max_applicable_idx = self.buffered_updates.max_index_to_apply(self.latest_tick);
+        let max_applicable_tick =
+            max_applicable_idx.and_then(|idx| self.buffered_updates.tick_at(idx));
 
         UpdatesIterator {
             channel: self,
             max_applicable_idx,
+            max_applicable_tick,
         }
     }
 
@@ -978,21 +1084,21 @@ impl GroupChannel {
 
             // inserts
             // TODO: remove updates that are duplicate for the same component
-            actions
-                .insert
-                .into_iter()
-                .for_each(|bytes| {
-                    if let Err(e) = component_registry.buffer(
-                        bytes,
-                        &mut buffered_entity,
-                        remote_tick,
-                        &mut remote_entity_map.remote_to_local,
-                        predicted,
-                        interpolated,
-                    ) {
-                        error!("could not insert a component to entity {:?}: {:?}", local_entity, e);
-                    }
-                });
+            actions.insert.into_iter().for_each(|bytes| {
+                if let Err(e) = component_registry.buffer(
+                    bytes,
+                    &mut buffered_entity,
+                    remote_tick,
+                    &mut remote_entity_map.remote_to_local,
+                    predicted,
+                    interpolated,
+                ) {
+                    error!(
+                        "could not insert a component to entity {:?}: {:?}",
+                        local_entity, e
+                    );
+                }
+            });
 
             // removals
             actions.remove.into_iter().for_each(|component_net_id| {
